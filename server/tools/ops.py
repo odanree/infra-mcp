@@ -43,6 +43,7 @@ class StatusResult(BaseModel):
     containers: list[ContainerStatus]
     total: int
     running: int
+    error: str | None = None  # populated when SSH/parse fails so the LLM sees the cause
 
 
 async def infra_status() -> StatusResult:
@@ -53,7 +54,15 @@ async def infra_status() -> StatusResult:
     """
     res = await run(compose("docker compose ps --format json --all"))
     if not res.ok:
-        return StatusResult(host=settings.infra_ssh_host, containers=[], total=0, running=0)
+        # Surface SSH failures explicitly instead of silently returning an
+        # empty list. Earlier version of this tool swallowed the rc + stderr
+        # and the caller had no way to tell "SSH down" from "stack empty".
+        err = (res.stderr or f"ssh rc={res.rc}").strip()[:500]
+        return StatusResult(
+            host=settings.infra_ssh_host,
+            containers=[], total=0, running=0,
+            error=f"ssh exec failed: {err}",
+        )
 
     containers: list[ContainerStatus] = []
     for line in res.stdout.strip().splitlines():
