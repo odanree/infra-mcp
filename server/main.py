@@ -12,6 +12,7 @@ from server.tools.ops import (
     infra_deploys,
     infra_disk,
     infra_logs,
+    infra_prune,
     infra_restart,
     infra_status,
     service_url,
@@ -76,6 +77,16 @@ async def infra_restart_tool(service: str, confirm: bool = False) -> dict:
 async def caddy_reload_tool(confirm: bool = False) -> dict:
     """Reload Caddy after a Caddyfile change. Requires confirm=true."""
     return (await caddy_reload(confirm=confirm)).model_dump()
+
+
+@mcp.tool()
+async def infra_prune_tool(target: str = "build_cache", confirm: bool = False) -> dict:
+    """Reclaim docker disk space. Requires confirm=true.
+
+    target: 'build_cache' (safest), 'dangling_images', 'stopped_containers',
+            'all_images' (riskier — removes any image not used by a running container).
+    """
+    return (await infra_prune(target=target, confirm=confirm)).model_dump()
 
 
 def main() -> None:

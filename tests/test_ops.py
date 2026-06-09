@@ -13,6 +13,7 @@ from server.tools.ops import (
     _parse_size_gib,
     infra_disk,
     infra_logs,
+    infra_prune,
     infra_restart,
     infra_status,
 )
@@ -153,6 +154,73 @@ async def test_infra_restart_runs_when_confirmed_and_allowlisted():
     assert result.confirmed is True
     assert result.rc == 0
     m.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_infra_logs_grep_no_match_is_not_an_error():
+    """grep exits 1 when there are no matches — should report grep_no_match=True,
+    NOT a docker compose failure. Catches the bug where infra_logs returned
+    '(ssh rc=1)' to the caller and looked like an SSH failure."""
+    no_match = SshResult(rc=1, stdout="", stderr="")
+    with patch("server.tools.ops.run", new=AsyncMock(return_value=no_match)):
+        result = await infra_logs("oci-api", since="1h", grep="error")
+    assert result.error is None
+    assert result.grep_no_match is True
+    assert result.lines == 0
+    assert result.content == ""
+
+
+@pytest.mark.asyncio
+async def test_infra_logs_surfaces_real_ssh_failure():
+    """When SSH genuinely fails (rc != 0 with stderr), error is populated and
+    the caller can render a useful diagnostic instead of bare logs."""
+    ssh_down = SshResult(
+        rc=255, stdout="",
+        stderr="ssh: connect to host 10.0.0.1 port 22: Connection refused\n",
+    )
+    with patch("server.tools.ops.run", new=AsyncMock(return_value=ssh_down)):
+        result = await infra_logs("oci-api", since="1h")
+    assert result.error is not None
+    assert "Connection refused" in result.error
+    assert result.grep_no_match is False
+    assert result.content == ""
+
+
+@pytest.mark.asyncio
+async def test_infra_prune_requires_confirm():
+    """No SSH should fire without confirm=true."""
+    with patch("server.tools.ops.run", new=AsyncMock(return_value=_ok(""))) as m:
+        result = await infra_prune("build_cache")
+    assert result.confirmed is False
+    assert result.rc == -2
+    m.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_infra_prune_rejects_unknown_target():
+    """Unknown targets short-circuit before any SSH so a typo can't accidentally
+    do something the operator didn't mean."""
+    with patch("server.tools.ops.run", new=AsyncMock(return_value=_ok(""))) as m:
+        result = await infra_prune("rm-rf-everything", confirm=True)
+    assert result.confirmed is False
+    assert result.rc == -3
+    m.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_infra_prune_extracts_reclaimed_summary_when_present():
+    """Docker prune prints 'Total reclaimed space: N.NN GB' — surface that
+    as a structured field instead of making the LLM parse stdout."""
+    stdout = (
+        "deleted: sha256:abc...\n"
+        "deleted: sha256:def...\n"
+        "Total reclaimed space: 9.448GB\n"
+    )
+    with patch("server.tools.ops.run", new=AsyncMock(return_value=_ok(stdout))):
+        result = await infra_prune("build_cache", confirm=True)
+    assert result.confirmed is True
+    assert result.rc == 0
+    assert result.reclaimed_summary == "Total reclaimed space: 9.448GB"
 
 
 def test_parse_size_gib_handles_units():

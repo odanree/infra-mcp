@@ -94,6 +94,9 @@ class LogsResult(BaseModel):
     truncated: bool
     since: str | None
     content: str
+    error: str | None = None        # populated only on real SSH/docker failure
+    grep_no_match: bool = False     # True when grep returned rc=1 (no matches),
+                                    # which is normal — distinguishes from real failure
 
 
 async def infra_logs(
@@ -130,7 +133,22 @@ async def infra_logs(
         cmd += " 2>&1"
 
     res = await run(compose(cmd), timeout_s=45.0)
-    content = res.stdout if res.ok else f"(ssh rc={res.rc}) {res.stderr}"
+
+    # grep exits 1 when nothing matched — that's a successful empty result,
+    # NOT a failure. We treat it as ok with grep_no_match=True so the calling
+    # LLM can render "no matches in last 1h" instead of misreporting an error.
+    grep_no_match = bool(grep) and res.rc == 1 and not res.stderr.strip()
+    error: str | None = None
+
+    if res.ok or grep_no_match:
+        content = res.stdout
+    else:
+        # Real failure: SSH non-zero, OR grep rc != 0/1, OR stderr is set.
+        # Surface the cause so callers don't misdiagnose like infra_status used to.
+        err_preview = (res.stderr or f"ssh rc={res.rc}").strip()[:500]
+        error = f"docker compose logs failed: {err_preview}"
+        content = ""
+
     # Final safety: never emit more than INFRA_MAX_LOG_LINES of output text.
     actual_lines = content.splitlines()
     truncated = len(actual_lines) > settings.infra_max_log_lines
@@ -142,6 +160,8 @@ async def infra_logs(
         lines=min(len(actual_lines), settings.infra_max_log_lines),
         truncated=truncated,
         since=since,
+        error=error,
+        grep_no_match=grep_no_match,
         content=content,
     )
 
@@ -317,6 +337,72 @@ async def infra_restart(service: str, confirm: bool = False) -> RestartResult:
     res = await run(compose(f"docker compose restart {service}"), timeout_s=60.0)
     return RestartResult(
         service=service, rc=res.rc, stdout=res.stdout, stderr=res.stderr, confirmed=True,
+    )
+
+
+class PruneResult(BaseModel):
+    target: str
+    rc: int
+    stdout: str
+    stderr: str
+    confirmed: bool
+    reclaimed_summary: str | None = None  # the "Total reclaimed space: ..." line
+
+
+_PRUNE_COMMANDS: dict[str, str] = {
+    # Build cache is always safe to prune — it's just compilation intermediaries.
+    "build_cache": "docker builder prune -af",
+    # Dangling images = no tag, not referenced by any container. Also safe.
+    "dangling_images": "docker image prune -f",
+    # All unused images (untagged + any tagged image not used by a running
+    # container). Higher impact — could remove an image you actually want.
+    "all_images": "docker image prune -af",
+    # Containers in 'exited' or 'created' state, never restarted.
+    "stopped_containers": "docker container prune -f",
+}
+
+
+async def infra_prune(target: str = "build_cache", confirm: bool = False) -> PruneResult:
+    """Reclaim docker disk space on the VPS. Requires confirm=true.
+
+    Targets (in order of safety):
+      build_cache         — compiler intermediates only. Always safe.
+      dangling_images     — untagged images not referenced by any container.
+      stopped_containers  — never-restarted exited / created containers.
+      all_images          — every image not used by a running container.
+                            HIGHER IMPACT — can remove an image you want.
+
+    Use `infra_disk` first to see what's reclaimable. After a prune,
+    `infra_disk` again to confirm the free space went up as expected.
+    """
+    if target not in _PRUNE_COMMANDS:
+        return PruneResult(
+            target=target, rc=-3, stdout="",
+            stderr=f"unknown target {target!r}. Valid: {sorted(_PRUNE_COMMANDS)}",
+            confirmed=False,
+        )
+    if not confirm:
+        return PruneResult(
+            target=target, rc=-2, stdout="",
+            stderr=f"confirm=true required to prune {target}. "
+                   "Run infra_disk first to see what would be reclaimed.",
+            confirmed=False,
+        )
+
+    cmd = _PRUNE_COMMANDS[target]
+    res = await run(cmd, timeout_s=120.0)
+
+    # Surface the human-readable "Total reclaimed space: N.NN GB" docker prints.
+    reclaimed: str | None = None
+    for line in res.stdout.splitlines():
+        if "Total reclaimed space" in line:
+            reclaimed = line.strip()
+            break
+
+    return PruneResult(
+        target=target, rc=res.rc,
+        stdout=res.stdout, stderr=res.stderr,
+        confirmed=True, reclaimed_summary=reclaimed,
     )
 
 
