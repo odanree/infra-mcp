@@ -44,8 +44,13 @@ async def run(remote_cmd: str, timeout_s: float = DEFAULT_TIMEOUT_S) -> SshResul
     responsibility, since this is internal-only and called from typed tool
     handlers (never from MCP-client string args).
     """
+    # INFRA_SSH_BIN overrides PATH resolution. On Windows, `which ssh` may
+    # return Git Bash's ssh.exe which has different ~/.ssh resolution than
+    # Windows OpenSSH and can hang even with BatchMode=yes. Default to
+    # whatever PATH gives us; user pins via .env when needed.
+    ssh_bin = settings.infra_ssh_bin or "ssh"
     argv = [
-        "ssh",
+        ssh_bin,
         "-o", "StrictHostKeyChecking=accept-new",
         "-o", "BatchMode=yes",
         "-o", f"ConnectTimeout={int(min(timeout_s, 15))}",
@@ -56,6 +61,11 @@ async def run(remote_cmd: str, timeout_s: float = DEFAULT_TIMEOUT_S) -> SshResul
     try:
         proc = await asyncio.create_subprocess_exec(
             *argv,
+            # stdin=DEVNULL: otherwise SSH inherits the MCP server's stdin
+            # (the stdio MCP protocol pipe) and can hang waiting on it. The
+            # symptom is "ssh timed out after Ns" even though BatchMode=yes
+            # should prevent interactive prompts.
+            stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )

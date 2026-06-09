@@ -21,6 +21,13 @@ class Settings(BaseSettings):
     infra_ssh_host: str = Field(default="", alias="INFRA_SSH_HOST")
     infra_compose_dir: str = Field(default="/opt/stack", alias="INFRA_COMPOSE_DIR")
 
+    # Optional override for the SSH binary path. On Windows, `which ssh` may
+    # find Git Bash's ssh.exe which has different ~/.ssh resolution than
+    # Windows OpenSSH and can hang from a subprocess context. Pin this to
+    # `C:\Windows\System32\OpenSSH\ssh.exe` if a vanilla `ssh` call doesn't
+    # work from a Claude Code MCP server context.
+    infra_ssh_bin: str = Field(default="", alias="INFRA_SSH_BIN")
+
     # Public domain Caddy terminates TLS on. Used by service_url.
     infra_public_domain: str = Field(default="example.com", alias="INFRA_PUBLIC_DOMAIN")
 
