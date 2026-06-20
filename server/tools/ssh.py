@@ -51,9 +51,12 @@ async def run(remote_cmd: str, timeout_s: float = DEFAULT_TIMEOUT_S) -> SshResul
     ssh_bin = settings.infra_ssh_bin or "ssh"
     argv = [
         ssh_bin,
-        "-o", "StrictHostKeyChecking=accept-new",
-        "-o", "BatchMode=yes",
-        "-o", f"ConnectTimeout={int(min(timeout_s, 15))}",
+        "-o",
+        "StrictHostKeyChecking=accept-new",
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        f"ConnectTimeout={int(min(timeout_s, 15))}",
         settings.infra_ssh_host,
         remote_cmd,
     ]
@@ -71,7 +74,8 @@ async def run(remote_cmd: str, timeout_s: float = DEFAULT_TIMEOUT_S) -> SshResul
         )
         try:
             stdout_bytes, stderr_bytes = await asyncio.wait_for(
-                proc.communicate(), timeout=timeout_s,
+                proc.communicate(),
+                timeout=timeout_s,
             )
         except TimeoutError:
             proc.kill()
@@ -83,7 +87,8 @@ async def run(remote_cmd: str, timeout_s: float = DEFAULT_TIMEOUT_S) -> SshResul
             )
     except FileNotFoundError:
         return SshResult(
-            rc=-1, stdout="",
+            rc=-1,
+            stdout="",
             stderr="ssh binary not found on PATH — install OpenSSH client",
         )
     return SshResult(
@@ -93,13 +98,48 @@ async def run(remote_cmd: str, timeout_s: float = DEFAULT_TIMEOUT_S) -> SshResul
     )
 
 
-def compose(cmd: str) -> str:
+class UnknownStackError(ValueError):
+    """Raised when a tool is invoked with `stack` not in INFRA_STACKS.
+
+    Carries the offending name + the allowed names so the caller's error
+    response can list the alternatives. Surfaced as a structured rejection
+    by the tools, never as an SSH call.
+    """
+
+    def __init__(self, requested: str, available: list[str]) -> None:
+        self.requested = requested
+        self.available = available
+        super().__init__(
+            f"unknown stack {requested!r}; available: {', '.join(sorted(available))}"
+        )
+
+
+def resolve_stack(stack: str | None) -> tuple[str, str]:
+    """Map a (possibly None) stack name to (name, compose_dir).
+
+    None resolves to the configured default. Unknown names raise
+    UnknownStackError so callers can return a structured rejection
+    without duplicating validation in every tool.
+    """
+    stacks = settings.stacks_map
+    if stack is None:
+        name = settings.default_stack_name
+        return name, stacks[name]
+    if stack not in stacks:
+        raise UnknownStackError(stack, list(stacks))
+    return stack, stacks[stack]
+
+
+def compose(cmd: str, stack: str | None = None) -> str:
     """Wrap a `docker compose <cmd>` invocation in a cd to the project dir.
 
-    Lets every tool build a one-liner without repeating the cd. Single quotes
-    around `cmd` keep it as a single argv item from the ssh perspective.
+    Lets every tool build a one-liner without repeating the cd. `stack`
+    selects which compose project on the box (multi-stack mode); None
+    uses the operator's configured default. Unknown names raise
+    UnknownStackError before any SSH call.
     """
-    return f"cd {settings.infra_compose_dir} && {cmd}"
+    _, compose_dir = resolve_stack(stack)
+    return f"cd {compose_dir} && {cmd}"
 
 
 def is_service_allowed(service: str) -> bool:

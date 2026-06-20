@@ -19,10 +19,16 @@ import json
 from datetime import datetime, timezone
 
 import httpx
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
 from server.config import settings
-from server.tools.ssh import compose, is_service_allowed, run
+from server.tools.ssh import (
+    UnknownStackError,
+    compose,
+    is_service_allowed,
+    resolve_stack,
+    run,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -33,26 +39,42 @@ from server.tools.ssh import compose, is_service_allowed, run
 class ContainerStatus(BaseModel):
     name: str
     image: str
-    state: str       # "running" | "exited" | "restarting" | ...
-    status: str      # the docker-rendered "Up 2 hours" / "Exited (137)" string
+    state: str  # "running" | "exited" | "restarting" | ...
+    status: str  # the docker-rendered "Up 2 hours" / "Exited (137)" string
     health: str | None = None
 
 
 class StatusResult(BaseModel):
     host: str
+    stack: str
     containers: list[ContainerStatus]
     total: int
     running: int
     error: str | None = None  # populated when SSH/parse fails so the LLM sees the cause
 
 
-async def infra_status() -> StatusResult:
+async def infra_status(stack: str | None = None) -> StatusResult:
     """List every container in the compose stack with its current state.
 
     Reads `docker compose ps --format json` on the VPS. Output is bounded
     by the number of services in the compose file — typically ≤30 rows.
+
+    `stack` selects which compose project to query (multi-stack mode);
+    None uses the operator's configured default.
     """
-    res = await run(compose("docker compose ps --format json --all"))
+    try:
+        stack_name, _ = resolve_stack(stack)
+    except UnknownStackError as e:
+        return StatusResult(
+            host=settings.infra_ssh_host,
+            stack=stack or "?",
+            containers=[],
+            total=0,
+            running=0,
+            error=str(e),
+        )
+
+    res = await run(compose("docker compose ps --format json --all", stack=stack_name))
     if not res.ok:
         # Surface SSH failures explicitly instead of silently returning an
         # empty list. Earlier version of this tool swallowed the rc + stderr
@@ -60,7 +82,10 @@ async def infra_status() -> StatusResult:
         err = (res.stderr or f"ssh rc={res.rc}").strip()[:500]
         return StatusResult(
             host=settings.infra_ssh_host,
-            containers=[], total=0, running=0,
+            stack=stack_name,
+            containers=[],
+            total=0,
+            running=0,
             error=f"ssh exec failed: {err}",
         )
 
@@ -72,16 +97,19 @@ async def infra_status() -> StatusResult:
             row = json.loads(line)
         except json.JSONDecodeError:
             continue
-        containers.append(ContainerStatus(
-            name=row.get("Name") or row.get("Service") or "?",
-            image=row.get("Image") or "?",
-            state=row.get("State") or "?",
-            status=row.get("Status") or "?",
-            health=row.get("Health") or None,
-        ))
+        containers.append(
+            ContainerStatus(
+                name=row.get("Name") or row.get("Service") or "?",
+                image=row.get("Image") or "?",
+                state=row.get("State") or "?",
+                status=row.get("Status") or "?",
+                health=row.get("Health") or None,
+            )
+        )
 
     return StatusResult(
         host=settings.infra_ssh_host,
+        stack=stack_name,
         containers=containers,
         total=len(containers),
         running=sum(1 for c in containers if c.state == "running"),
@@ -90,13 +118,14 @@ async def infra_status() -> StatusResult:
 
 class LogsResult(BaseModel):
     service: str
+    stack: str
     lines: int
     truncated: bool
     since: str | None
     content: str
-    error: str | None = None        # populated only on real SSH/docker failure
-    grep_no_match: bool = False     # True when grep returned rc=1 (no matches),
-                                    # which is normal — distinguishes from real failure
+    error: str | None = None  # populated only on real SSH/docker failure
+    grep_no_match: bool = False  # True when grep returned rc=1 (no matches),
+    # which is normal — distinguishes from real failure
 
 
 async def infra_logs(
@@ -104,6 +133,7 @@ async def infra_logs(
     tail: int = 100,
     since: str | None = None,
     grep: str | None = None,
+    stack: str | None = None,
 ) -> LogsResult:
     """Tail log lines from one compose service.
 
@@ -115,7 +145,22 @@ async def infra_logs(
                  `docker compose logs --since`.
         grep:    Optional substring filter applied via `grep -F` on the box.
                  Plain string match only; never a regex (no injection surface).
+        stack:   Compose project to query (multi-stack mode). None uses the
+                 operator's configured default.
     """
+    try:
+        stack_name, _ = resolve_stack(stack)
+    except UnknownStackError as e:
+        return LogsResult(
+            service=service,
+            stack=stack or "?",
+            lines=0,
+            truncated=False,
+            since=since,
+            content="",
+            error=str(e),
+        )
+
     tail = max(1, min(tail, settings.infra_max_log_lines))
     cmd = f"docker compose logs --tail={tail}"
     if since:
@@ -132,7 +177,7 @@ async def infra_logs(
     else:
         cmd += " 2>&1"
 
-    res = await run(compose(cmd), timeout_s=45.0)
+    res = await run(compose(cmd, stack=stack_name), timeout_s=45.0)
 
     # grep exits 1 when nothing matched — that's a successful empty result,
     # NOT a failure. We treat it as ok with grep_no_match=True so the calling
@@ -157,6 +202,7 @@ async def infra_logs(
 
     return LogsResult(
         service=service,
+        stack=stack_name,
         lines=min(len(actual_lines), settings.infra_max_log_lines),
         truncated=truncated,
         since=since,
@@ -228,7 +274,13 @@ def _parse_size_gib(size: str) -> float | None:
         n = float(s[:-1] if unit else s)
     except ValueError:
         return None
-    factor = {"K": 1 / 1024 / 1024, "M": 1 / 1024, "G": 1, "T": 1024, "P": 1024 * 1024}.get(unit, 1)
+    factor = {
+        "K": 1 / 1024 / 1024,
+        "M": 1 / 1024,
+        "G": 1,
+        "T": 1024,
+        "P": 1024 * 1024,
+    }.get(unit, 1)
     return round(n * factor, 2)
 
 
@@ -249,9 +301,13 @@ async def service_url(service: str, scheme: str = "https") -> ServiceURLResult:
     try:
         async with httpx.AsyncClient(timeout=8.0, follow_redirects=True) as client:
             r = await client.get(url)
-        return ServiceURLResult(service=service, url=url, http_status=r.status_code, error=None)
+        return ServiceURLResult(
+            service=service, url=url, http_status=r.status_code, error=None
+        )
     except httpx.HTTPError as e:
-        return ServiceURLResult(service=service, url=url, http_status=None, error=str(e))
+        return ServiceURLResult(
+            service=service, url=url, http_status=None, error=str(e)
+        )
 
 
 class DeployRunSummary(BaseModel):
@@ -290,15 +346,21 @@ async def infra_deploys(limit_per_repo: int = 5) -> list[DeployRunSummary]:
             except httpx.HTTPError:
                 continue
             for run_row in r.json().get("workflow_runs", []):
-                summaries.append(DeployRunSummary(
-                    repo=repo,
-                    run_id=run_row["id"],
-                    conclusion=run_row.get("conclusion"),
-                    status=run_row.get("status", "unknown"),
-                    head_branch=run_row.get("head_branch", ""),
-                    commit_message=(run_row.get("head_commit") or {}).get("message", "").split("\n")[0],
-                    created_at=run_row.get("created_at", datetime.now(timezone.utc).isoformat()),
-                ))
+                summaries.append(
+                    DeployRunSummary(
+                        repo=repo,
+                        run_id=run_row["id"],
+                        conclusion=run_row.get("conclusion"),
+                        status=run_row.get("status", "unknown"),
+                        head_branch=run_row.get("head_branch", ""),
+                        commit_message=(run_row.get("head_commit") or {})
+                        .get("message", "")
+                        .split("\n")[0],
+                        created_at=run_row.get(
+                            "created_at", datetime.now(timezone.utc).isoformat()
+                        ),
+                    )
+                )
     return summaries
 
 
@@ -315,28 +377,55 @@ class RestartResult(BaseModel):
     confirmed: bool
 
 
-async def infra_restart(service: str, confirm: bool = False) -> RestartResult:
+async def infra_restart(
+    service: str,
+    confirm: bool = False,
+    stack: str | None = None,
+) -> RestartResult:
     """Restart a compose service. Requires confirm=true and service in allowlist.
 
     Use after a config change or when a container looks stuck. Health-check
     follow-up is the caller's responsibility — run `infra_status` afterwards
     to confirm it came back.
+
+    `stack` selects which compose project to operate on (multi-stack mode);
+    None uses the operator's configured default.
     """
     if not confirm:
         return RestartResult(
-            service=service, rc=-2, stdout="",
+            service=service,
+            rc=-2,
+            stdout="",
             stderr=f"confirm=true required to restart {service}. This is intentional.",
             confirmed=False,
         )
     if not is_service_allowed(service):
         return RestartResult(
-            service=service, rc=-3, stdout="",
+            service=service,
+            rc=-3,
+            stdout="",
             stderr=f"{service!r} is not in INFRA_ALLOWED_SERVICES",
             confirmed=False,
         )
-    res = await run(compose(f"docker compose restart {service}"), timeout_s=60.0)
+    try:
+        stack_name, _ = resolve_stack(stack)
+    except UnknownStackError as e:
+        return RestartResult(
+            service=service,
+            rc=-4,
+            stdout="",
+            stderr=str(e),
+            confirmed=False,
+        )
+    res = await run(
+        compose(f"docker compose restart {service}", stack=stack_name), timeout_s=60.0
+    )
     return RestartResult(
-        service=service, rc=res.rc, stdout=res.stdout, stderr=res.stderr, confirmed=True,
+        service=service,
+        rc=res.rc,
+        stdout=res.stdout,
+        stderr=res.stderr,
+        confirmed=True,
     )
 
 
@@ -362,7 +451,9 @@ _PRUNE_COMMANDS: dict[str, str] = {
 }
 
 
-async def infra_prune(target: str = "build_cache", confirm: bool = False) -> PruneResult:
+async def infra_prune(
+    target: str = "build_cache", confirm: bool = False
+) -> PruneResult:
     """Reclaim docker disk space on the VPS. Requires confirm=true.
 
     Targets (in order of safety):
@@ -377,15 +468,19 @@ async def infra_prune(target: str = "build_cache", confirm: bool = False) -> Pru
     """
     if target not in _PRUNE_COMMANDS:
         return PruneResult(
-            target=target, rc=-3, stdout="",
+            target=target,
+            rc=-3,
+            stdout="",
             stderr=f"unknown target {target!r}. Valid: {sorted(_PRUNE_COMMANDS)}",
             confirmed=False,
         )
     if not confirm:
         return PruneResult(
-            target=target, rc=-2, stdout="",
+            target=target,
+            rc=-2,
+            stdout="",
             stderr=f"confirm=true required to prune {target}. "
-                   "Run infra_disk first to see what would be reclaimed.",
+            "Run infra_disk first to see what would be reclaimed.",
             confirmed=False,
         )
 
@@ -400,9 +495,12 @@ async def infra_prune(target: str = "build_cache", confirm: bool = False) -> Pru
             break
 
     return PruneResult(
-        target=target, rc=res.rc,
-        stdout=res.stdout, stderr=res.stderr,
-        confirmed=True, reclaimed_summary=reclaimed,
+        target=target,
+        rc=res.rc,
+        stdout=res.stdout,
+        stderr=res.stderr,
+        confirmed=True,
+        reclaimed_summary=reclaimed,
     )
 
 
@@ -422,11 +520,17 @@ async def caddy_reload(confirm: bool = False) -> CaddyReloadResult:
     """
     if not confirm:
         return CaddyReloadResult(
-            rc=-2, stdout="",
+            rc=-2,
+            stdout="",
             stderr="confirm=true required to reload Caddy",
             confirmed=False,
         )
-    res = await run("docker exec portfolio-caddy caddy reload --config /etc/caddy/Caddyfile")
+    res = await run(
+        "docker exec portfolio-caddy caddy reload --config /etc/caddy/Caddyfile"
+    )
     return CaddyReloadResult(
-        rc=res.rc, stdout=res.stdout, stderr=res.stderr, confirmed=True,
+        rc=res.rc,
+        stdout=res.stdout,
+        stderr=res.stderr,
+        confirmed=True,
     )
