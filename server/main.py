@@ -18,7 +18,9 @@ from server.tools.ops import (
     service_url,
 )
 
-logging.basicConfig(level=settings.log_level, format="%(asctime)s %(levelname)s %(name)s %(message)s")
+logging.basicConfig(
+    level=settings.log_level, format="%(asctime)s %(levelname)s %(name)s %(message)s"
+)
 
 mcp = FastMCP(
     "infra-mcp",
@@ -33,9 +35,14 @@ mcp = FastMCP(
 
 
 @mcp.tool()
-async def infra_status_tool() -> dict:
-    """List every container in the compose stack with state + status string."""
-    return (await infra_status()).model_dump()
+async def infra_status_tool(stack: str | None = None) -> dict:
+    """List every container in the compose stack with state + status string.
+
+    `stack` picks which compose project when the box hosts several
+    (multi-stack mode). Omit for the operator's configured default.
+    Names come from INFRA_STACKS keys.
+    """
+    return (await infra_status(stack=stack)).model_dump()
 
 
 @mcp.tool()
@@ -44,9 +51,15 @@ async def infra_logs_tool(
     tail: int = 100,
     since: str | None = None,
     grep: str | None = None,
+    stack: str | None = None,
 ) -> dict:
-    """Tail logs from one compose service. `since` accepts 10m / 1h / 2d. `grep` is plain text."""
-    return (await infra_logs(service, tail=tail, since=since, grep=grep)).model_dump()
+    """Tail logs from one compose service. `since` accepts 10m / 1h / 2d. `grep` is plain text.
+
+    `stack` picks which compose project (multi-stack mode); omit for default.
+    """
+    return (
+        await infra_logs(service, tail=tail, since=since, grep=grep, stack=stack)
+    ).model_dump()
 
 
 @mcp.tool()
@@ -68,9 +81,16 @@ async def infra_deploys_tool(limit_per_repo: int = 5) -> list[dict]:
 
 
 @mcp.tool()
-async def infra_restart_tool(service: str, confirm: bool = False) -> dict:
-    """Restart a compose service. Requires confirm=true AND service in INFRA_ALLOWED_SERVICES."""
-    return (await infra_restart(service, confirm=confirm)).model_dump()
+async def infra_restart_tool(
+    service: str,
+    confirm: bool = False,
+    stack: str | None = None,
+) -> dict:
+    """Restart a compose service. Requires confirm=true AND service in INFRA_ALLOWED_SERVICES.
+
+    `stack` picks which compose project (multi-stack mode); omit for default.
+    """
+    return (await infra_restart(service, confirm=confirm, stack=stack)).model_dump()
 
 
 @mcp.tool()
